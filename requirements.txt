@@ -8,4 +8,3 @@ joblib
 matplotlib
 faiss-cpu
 pandas
-EOF
