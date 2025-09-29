@@ -1,0 +1,17 @@
+cd /scratch0/Targol
+mkdir -p eeg-foundation
+cd eeg-foundation
+cat > .dockerignore << 'EOF'
+data/
+results/
+outputs/
+checkpoints/
+wandb/
+mlruns/
+*.npz
+*.npy
+*.pth
+*.pt
+*.ckpt
+__pycache__/
+EOF

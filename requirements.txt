@@ -1,0 +1,11 @@
+numpy
+scipy
+mne
+pyedflib
+PyYAML
+tqdm
+joblib
+matplotlib
+faiss-cpu
+pandas
+EOF
