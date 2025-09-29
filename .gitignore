@@ -1,0 +1,184 @@
+# -------------------------
+# OS & Editor cruft
+# -------------------------
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.orig
+*.bak
+*.tmp
+*.temp
+~$*
+.desktop
+*.kate-swp
+
+# VSCode / JetBrains
+.vscode/
+*.code-workspace
+.idea/
+*.iml
+
+# -------------------------
+# Python
+# -------------------------
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.pyo
+.pytype/
+.mypy_cache/
+.pytest_cache/
+.dmypy.json
+ruff_cache/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+*.whl
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+*.env
+.env.*
+.python-version
+
+# Jupyter
+.ipynb_checkpoints/
+.jupyter/
+
+# Testing & coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+
+# Logs
+logs/
+*.log
+log/
+nohup.out
+
+# -------------------------
+# Data & Artifacts
+# (Keep small configs; ignore heavy data)
+# -------------------------
+# Ignore all data by default...
+data/**
+# ...but keep lightweight config/metadata templates
+!data/.gitkeep
+!data/README.md
+!data/configs/**
+!data/configs/*.yaml
+!data/configs/*.yml
+!data/configs/*.json
+!data/configs/*.csv
+
+# Big array files commonly produced
+data/**/*.npy
+data/**/*.npz
+data/**/*.mat
+data/**/*.pkl
+data/**/*.csv # comment this out if you plan to version CSV datasets
+
+# External caches (if placed inside repo)
+.huggingface/
+hf_cache/
+datasets/  # comment out if you maintain small toy datasets here
+.cache/
+**/.cache/
+
+# Retrieval indexes / embeddings (rebuildable)
+retrieval/indexes/**
+!retrieval/indexes/.gitkeep
+retrieval/**/*.faiss
+retrieval/**/*.index
+
+# Model weights & training artifacts
+checkpoints/
+weights/
+runs/
+outputs/
+results/
+lightning_logs/
+wandb/
+mlruns/
+optuna_studies/
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.tflite
+
+# Numpy exports outside data/ (optional)
+results/**/*.npy
+outputs/**/*.npy
+
+# SQLite/DB artifacts
+*.db
+*.sqlite
+*.sqlite3
+
+# SLURM / scheduler logs
+slurm-*.out
+slurm-*.err
+
+# -------------------------
+# Security / Secrets
+# -------------------------
+*.pem
+*.key
+*.crt
+*.p12
+*id_rsa*
+*id_dsa*
+*kaggle.json
+*credentials*
+*token*
+*.secret*
+.secrets/
+
+# -------------------------
+# LaTeX (paper/)
+# -------------------------
+paper/**/*.aux
+paper/**/*.log
+paper/**/*.bbl
+paper/**/*.blg
+paper/**/*.brf
+paper/**/*.synctex.gz
+paper/**/*.out
+paper/**/*.toc
+paper/**/*.lof
+paper/**/*.lot
+paper/**/*.fls
+paper/**/*.fdb_latexmk
+paper/**/*.xdv
+# Keep PDFs if you want to version the compiled paper
+# (comment the next line IN if you prefer to ignore PDFs)
+# paper/**/*.pdf
+
+# -------------------------
+# Docker / Containers
+# -------------------------
+*.pid
+*.pid.lock
+
+# -------------------------
+# Misc project temp
+# -------------------------
+tmp/
+temp/
+**/__temp__/
+**/.ipynb_checkpoints/
