@@ -1,17 +1,16 @@
-# configs/efm_base.yaml
-
 seed: 42
 
-# where your LOSO loader pulls from
+# -------- Data --------
 data:
-  root: /data/processed
-  datasets:
-    - chbmit
-  subjects: [ chb01, chb02, chb03, chb04, chb05 ]   # or your full list
+  root: /data/processed            # Docker mount root
+  # Optional: list datasets to speed up discovery (these are your folders)
+  datasets: [ chbmit, tusz_v2.0.3, tuh_eeg_epilepsy_v2.0.1 ]
+  # subjects: []                  # leave empty -> auto-discover from filenames
 
-# top-level in_ch (so the old code works)
+# Number of EEG channels after harmonization (10–20 template)
 in_ch: 19
 
+# -------- Model (EFM) --------
 model:
   dim: 256
   raw_depth: 4
@@ -25,15 +24,33 @@ model:
   patch2d: [ 8, 8 ]
   proj_dim: 128
   cls_hidden: 256
-  use_hazard: false
+  use_hazard: false     # set true when hazard targets are available
   hz_bins: 12
 
+# -------- Training --------
 train:
   batch_size: 16
   lr: 3.0e-4
   weight_decay: 0.05
-  epochs: 5
-  pos_weight: 3.0
 
+  # epochs & early stopping
+  epochs: 100
+  early_stop_patience: 15
+  early_stop_min_delta: 0.001
+
+  # imbalance handling
+  loss: focal              # {bce|focal}
+  focal_alpha: 0.75
+  focal_gamma: 2.0
+  pos_weight: 3.0          # used only if loss: bce
+  oversample_preictal: true
+
+  # hazard head (if model returns hazard logits & data has hazard targets)
+  hazard_lambda: 1.0
+
+  # init from a checkpoint (optional)
+  # load_pretrained: /workspace/runs/chb_pretrain/efm_pretrained.pt
+
+# -------- I/O --------
 io:
   workers: 8

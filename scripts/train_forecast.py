@@ -4,7 +4,7 @@ import csv
 import json
 import argparse
 import random
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Iterable, Set
 
 import torch
 
@@ -13,7 +13,7 @@ torch.backends.cudnn.deterministic = True
 
 import numpy as np
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 try:
     import yaml
@@ -64,7 +64,125 @@ def forward_safe(model, *args, **kwargs):
 
 
 # ----------------------------
-# Logit resolver (handles dict outputs & embeddings)
+# Subject discovery (from filenames)
+# ----------------------------
+def _extract_sid_from_name(fname: str) -> str:
+    base = os.path.basename(fname)
+    if base.startswith("chb"):
+        # chb04_15__... -> chb04
+        return base.split("_")[0]
+    if "_s" in base:
+        # aaaaapwd_s001_t000__... -> s001
+        try:
+            return "s" + base.split("_s")[1].split("_")[0]
+        except Exception:
+            return "unknown"
+    return "unknown"
+
+
+def discover_subjects(root: str, datasets: Optional[Iterable[str]] = None,
+                      max_files: int = 1_000_000) -> List[str]:
+    """
+    Walk the processed tree(s) and infer subject IDs from .npz filenames.
+    """
+    roots = []
+    if datasets:
+        roots = [os.path.join(root, d) for d in datasets]
+    else:
+        roots = [root]
+
+    subs: Set[str] = set()
+    seen = 0
+    for r in roots:
+        if not os.path.isdir(r):
+            continue
+        for dirpath, _, files in os.walk(r):
+            for f in files:
+                if not f.endswith(".npz"):
+                    continue
+                sid = _extract_sid_from_name(f)
+                if sid != "unknown":
+                    subs.add(sid)
+                seen += 1
+                if seen >= max_files:
+                    break
+            if seen >= max_files:
+                break
+        if seen >= max_files:
+            break
+    out = sorted(list(subs))
+    if not out:
+        raise RuntimeError(f"No subjects discovered under {roots}. Are your .npz files mounted?")
+    return out
+
+
+# ----------------------------
+# Losses & helpers
+# ----------------------------
+class FocalLoss(nn.Module):
+    """
+    Binary focal loss with logits.
+    """
+
+    def __init__(self, alpha: float = 0.5, gamma: float = 2.0, reduction: str = "mean"):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor):
+        if logits.ndim > 1:
+            logits = logits.squeeze(-1)
+        targets = targets.float()
+        bce = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        p = torch.sigmoid(logits)
+        pt = p * targets + (1 - p) * (1 - targets)  # p_t
+        focal = (1 - pt).pow(self.gamma) * bce
+        if self.alpha is not None:
+            alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+            focal = alpha_t * focal
+        if self.reduction == "mean":
+            return focal.mean()
+        if self.reduction == "sum":
+            return focal.sum()
+        return focal
+
+
+def make_loss(cfg_train: Dict):
+    loss_name = str(cfg_train.get("loss", "bce")).lower()
+    if loss_name == "focal":
+        alpha = float(cfg_train.get("focal_alpha", 0.75))
+        gamma = float(cfg_train.get("focal_gamma", 2.0))
+        return FocalLoss(alpha=alpha, gamma=gamma)
+    # default BCE with optional pos_weight
+    pos_weight = float(cfg_train.get("pos_weight", 1.0))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    pw = torch.tensor([pos_weight], dtype=torch.float32, device=device)
+    return nn.BCEWithLogitsLoss(pos_weight=pw)
+
+
+def add_hazard_loss_if_available(raw_out, batch, loss_total, device):
+    """
+    If model returns 'hazard_logits' (B, H) and batch has 'hazard_target' (B, H in {0,1}),
+    add BCE loss over hazard bins. Scaled by optional batch['hazard_lambda'] or cfg.
+    """
+    if not isinstance(raw_out, dict):
+        return loss_total
+    hz = raw_out.get("hazard_logits", None)
+    tgt = batch.get("hazard_target", None)
+    if hz is None or tgt is None:
+        return loss_total
+    if hz.ndim != 2 or tgt.ndim != 2:
+        return loss_total
+    hz = hz.to(device)
+    tgt = tgt.float().to(device)
+    hz_loss = torch.nn.functional.binary_cross_entropy_with_logits(hz, tgt)
+    lam = float(batch.get("hazard_lambda", 1.0))
+    return loss_total + lam * hz_loss
+
+
+# ----------------------------
+# Logit resolver (dict outputs & embeddings)
 # ----------------------------
 def _get_base(model):
     return model.module if isinstance(model, nn.DataParallel) else model
@@ -72,13 +190,11 @@ def _get_base(model):
 
 def extract_logits(model, raw_out, device, opt: Optional[torch.optim.Optimizer] = None):
     """Return a 1-D tensor of logits (B,), creating an aux head if needed."""
-    # 1) If dict, try common keys
     if isinstance(raw_out, dict):
         for k in ("forecast_logit", "logits", "y_pred", "pred"):
             if k in raw_out and torch.is_tensor(raw_out[k]):
                 t = raw_out[k]
                 return t.squeeze(-1) if t.ndim > 1 else t
-        # 2) Try embeddings -> attach/use aux head
         for k in ("fused_emb", "emb", "features"):
             if k in raw_out and torch.is_tensor(raw_out[k]):
                 emb = raw_out[k]
@@ -91,37 +207,40 @@ def extract_logits(model, raw_out, device, opt: Optional[torch.optim.Optimizer] 
                         if opt is not None:
                             opt.add_param_group({"params": head.parameters()})
                     return head(emb).squeeze(-1)
-        # 3) Fallback to first tensor in dict
+        # fallback: first tensor in dict
         for v in raw_out.values():
             if torch.is_tensor(v):
                 t = v
-                break
-        else:
-            raise ValueError("Model output dict contains no tensors.")
+                return t.squeeze(-1) if t.ndim > 1 else t
+        raise ValueError("Model output dict contains no tensors.")
     else:
         t = raw_out
-
-    # If still 2D features, attach/use aux head
-    if torch.is_tensor(t) and t.ndim == 2 and t.size(1) > 1:
-        base = _get_base(model)
-        head = getattr(base, "_aux_head", None)
-        if head is None:
-            head = nn.Linear(t.size(1), 1).to(device)
-            setattr(base, "_aux_head", head)
-            if opt is not None:
-                opt.add_param_group({"params": head.parameters()})
-        t = head(t)
-
-    return t.squeeze(-1) if t.ndim > 1 else t
+        if torch.is_tensor(t) and t.ndim == 2 and t.size(1) > 1:
+            base = _get_base(model)
+            head = getattr(base, "_aux_head", None)
+            if head is None:
+                head = nn.Linear(t.size(1), 1).to(device)
+                setattr(base, "_aux_head", head)
+                if opt is not None:
+                    opt.add_param_group({"params": head.parameters()})
+            t = head(t)
+        return t.squeeze(-1) if t.ndim > 1 else t
 
 
 # ----------------------------
 # Data builders
 # ----------------------------
-def _make_loader(ds, batch_size: int, shuffle: bool, workers: int, drop_last: bool) -> DataLoader:
+def _make_loader(ds, batch_size: int, shuffle: bool, workers: int, drop_last: bool,
+                 sampler: Optional[WeightedRandomSampler] = None) -> DataLoader:
     return DataLoader(
-        ds, batch_size=batch_size, shuffle=shuffle,
-        num_workers=workers, pin_memory=True, drop_last=drop_last
+        ds,
+        batch_size=batch_size,
+        shuffle=(sampler is None) and shuffle,
+        sampler=sampler,
+        num_workers=workers,
+        pin_memory=True,
+        drop_last=drop_last,
+        persistent_workers=(workers > 0),
     )
 
 
@@ -129,37 +248,66 @@ def build_dataloaders(cfg: Dict, test_subject: str, eval_subject: Optional[str])
     data_cfg = cfg.get("data", {}) or {}
     data_cfg.setdefault("root", "/data/processed")
 
+    # If subjects are not provided, discover and inject (so LOSODataset can pass them down)
+    if "subjects" not in data_cfg or not data_cfg["subjects"]:
+        discovered = discover_subjects(data_cfg["root"], data_cfg.get("datasets"))
+        data_cfg["subjects"] = discovered
+        print(f"[Auto] Discovered {len(discovered)} subjects.")
+
     from efm.data.dataset import LOSODataset
     ds_tr = LOSODataset(split="train", test_subject=test_subject, eval_subject=eval_subject, **data_cfg)
     ds_ev = LOSODataset(split="eval", test_subject=test_subject, eval_subject=eval_subject, **data_cfg)
     ds_te = LOSODataset(split="test", test_subject=test_subject, eval_subject=eval_subject, **data_cfg)
 
     world_size = max(1, torch.cuda.device_count())
-    bs_cfg = cfg["train"]["batch_size"]
+    bs_cfg = int(cfg["train"]["batch_size"])
     batch_size = max(world_size, (bs_cfg // world_size) * world_size)
     if batch_size != bs_cfg:
         print(f"[Info] Adjusted batch_size {bs_cfg} -> {batch_size} for {world_size} GPUs.")
         cfg["train"]["batch_size"] = batch_size
 
-    workers = cfg.get("io", {}).get("workers", 4)
+    workers = int(cfg.get("io", {}).get("workers", 8))
 
-    dl_tr = _make_loader(ds_tr, batch_size, True, workers, drop_last=True)
+    # Optional oversampling (preictal minority)
+    sampler = None
+    if bool(cfg["train"].get("oversample_preictal", False)):
+        labels = _collect_labels_fast(ds_tr)
+        pos = max(1, sum(labels))
+        neg = max(1, len(labels) - pos)
+        w_pos = neg / (pos + neg)
+        w_neg = pos / (pos + neg)
+        weights = [w_pos if y == 1 else w_neg for y in labels]
+        sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+        print(f"[Oversample] pos={pos}, neg={neg}, w_pos={w_pos:.3f}, w_neg={w_neg:.3f}")
+
+    dl_tr = _make_loader(ds_tr, batch_size, True, workers, drop_last=True, sampler=sampler)
     dl_ev = _make_loader(ds_ev, batch_size, False, workers, drop_last=True)
     dl_te = _make_loader(ds_te, batch_size, False, workers, drop_last=True)
-
     return dl_tr, dl_ev, dl_te
+
+
+def _collect_labels_fast(ds) -> List[int]:
+    """
+    Try to collect labels from dataset file list without fully loading tensors.
+    Works if ds exposes `files` list of .npz windows.
+    """
+    ys = []
+    if hasattr(ds, "files"):
+        import numpy as _np
+        for p in ds.files:
+            with _np.load(p, allow_pickle=True) as d:
+                ys.append(int(d["label"]))
+    else:
+        # Fallback: sample first N items (slower)
+        N = min(len(ds), 10000)
+        for i in range(N):
+            ys.append(int(ds[i]["y"]))
+    return ys
 
 
 # ----------------------------
 # Loss / Metrics
 # ----------------------------
-def bce_logits_loss(pos_weight: float):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    pw = torch.tensor([pos_weight], dtype=torch.float32, device=device)
-    return nn.BCEWithLogitsLoss(pos_weight=pw)
-
-
-@torch.no_grad()
 def compute_metrics(logits: torch.Tensor, y: torch.Tensor) -> Dict[str, float]:
     if logits.ndim > 1:
         logits = logits.squeeze(-1)
@@ -183,9 +331,8 @@ def compute_metrics(logits: torch.Tensor, y: torch.Tensor) -> Dict[str, float]:
 # ----------------------------
 # Train / Eval loops
 # ----------------------------
-def train_one_epoch(model, dl, opt, pos_weight, device):
+def train_one_epoch(model, dl, opt, loss_fn, device, hazard_lambda: float):
     model.train()
-    loss_fn = bce_logits_loss(pos_weight)
     total, n = 0.0, 0
     for batch in dl:
         batch = to_device(batch, device)
@@ -196,9 +343,13 @@ def train_one_epoch(model, dl, opt, pos_weight, device):
         raw_out = forward_safe(model, x, mask_missing=mm)
         logits = extract_logits(model, raw_out, device, opt=opt)
         loss = loss_fn(logits, y)
+
+        # optional hazard loss if present
+        batch["hazard_lambda"] = hazard_lambda
+        loss = add_hazard_loss_if_available(raw_out, batch, loss, device)
+
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        # also clip aux head if present
         base = _get_base(model)
         if hasattr(base, "_aux_head"):
             nn.utils.clip_grad_norm_(base._aux_head.parameters(), 1.0)
@@ -213,15 +364,14 @@ def train_one_epoch(model, dl, opt, pos_weight, device):
 def evaluate(model, dl, device):
     model.eval()
     all_logits, all_y = [], []
-    base = _get_base(model)
     for batch in dl:
         batch = to_device(batch, device)
         x, mm, y = batch["x"], batch.get("mm", None), batch["y"].long()
         x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6).contiguous()
 
         raw_out = forward_safe(model, x, mask_missing=mm)
-        # use same aux head if it exists
-        if isinstance(raw_out, dict) and "forecast_logit" in raw_out:
+        # prefer direct forecast logit if provided
+        if isinstance(raw_out, dict) and "forecast_logit" in raw_out and torch.is_tensor(raw_out["forecast_logit"]):
             logits = raw_out["forecast_logit"]
             logits = logits.squeeze(-1) if logits.ndim > 1 else logits
         else:
@@ -239,14 +389,40 @@ def evaluate(model, dl, device):
 
 
 # ----------------------------
+# Early stopping
+# ----------------------------
+class EarlyStopper:
+    def __init__(self, patience=10, min_delta=0.0, mode="max"):
+        self.patience = int(patience)
+        self.min_delta = float(min_delta)
+        self.mode = mode
+        self.best = None
+        self.bad = 0
+
+    def step(self, val):
+        if self.best is None:
+            self.best = val
+            return False
+        improve = (val - self.best) > self.min_delta if self.mode == "max" else (self.best - val) > self.min_delta
+        if improve:
+            self.best = val
+            self.bad = 0
+            return False
+        self.bad += 1
+        return self.bad >= self.patience
+
+
+# ----------------------------
 # LOSO runner
 # ----------------------------
 def subject_list_from_cfg(cfg):
     data_cfg = cfg.get("data", {}) or {}
     subs = data_cfg.get("subjects", None)
-    if subs is not None:
+    if subs:
         return subs
-    raise RuntimeError("Please define cfg['data']['subjects'].")
+    # auto-discover
+    subs = discover_subjects(data_cfg.get("root", "/data/processed"), data_cfg.get("datasets"))
+    return subs
 
 
 def loso_eval(cfg, out_dir, subjects_limit=None):
@@ -254,20 +430,30 @@ def loso_eval(cfg, out_dir, subjects_limit=None):
     results_csv = os.path.join(out_dir, "results_loso.csv")
     print(f"[Info] Results will be written to: {results_csv}")
 
+    # import model + config
+    from efm.models.efm_model import EFM, EFMConfig
+
+    # Train knobs
+    lr = float(cfg["train"].get("lr", 3e-4))
+    weight_decay = float(cfg["train"].get("weight_decay", 0.05))
+    max_epochs = int(cfg["train"].get("epochs", 80))
+    patience = int(cfg["train"].get("early_stop_patience", 15))
+    min_delta = float(cfg["train"].get("early_stop_min_delta", 0.001))
+    hazard_lambda = float(cfg["train"].get("hazard_lambda", 1.0))
+
+    mcfg = cfg.get("model", {})
+    in_ch = int(cfg.get("in_ch", mcfg.get("in_ch", 19)))
+
+    # GPU
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        print(f"[CUDA] Using {torch.cuda.device_count()} GPU(s): "
+              f"{[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]}")
+
+    # Subjects
     subjects = subject_list_from_cfg(cfg)
     if subjects_limit:
         subjects = subjects[:subjects_limit]
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    from efm.models.efm_model import EFM, EFMConfig
-
-    lr = cfg["train"].get("lr", 1e-3)
-    weight_decay = cfg["train"].get("weight_decay", 0.0)
-    max_epochs = cfg["train"].get("epochs", 10)
-    pos_weight = cfg["train"].get("pos_weight", 1.0)
-    mcfg = cfg.get("model", {})
-    in_ch = cfg.get("in_ch", mcfg.get("in_ch", 19))
 
     rows = []
     for i, test_subject in enumerate(subjects, start=1):
@@ -297,22 +483,43 @@ def loso_eval(cfg, out_dir, subjects_limit=None):
         )
 
         model = EFM(efmcfg).to(device)
+
+        # Optional: load pretrained
+        pretrain_path = cfg.get("train", {}).get("load_pretrained", "")
+        if pretrain_path and os.path.exists(pretrain_path):
+            state = torch.load(pretrain_path, map_location="cpu")
+            if isinstance(state, dict) and "model" in state:
+                state = state["model"]
+            try:
+                model.load_state_dict(state, strict=False)
+            except RuntimeError:
+                state = {k.replace("module.", ""): v for k, v in state.items()}
+                model.load_state_dict(state, strict=False)
+            print(f"[Init] Loaded pretrained weights from {pretrain_path}")
+
         if torch.cuda.device_count() > 1:
             print(f"[Info] Using DataParallel over {torch.cuda.device_count()} GPUs")
             model = nn.DataParallel(model)
 
         opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-        best_ev, best_state = -1.0, None
+        loss_fn = make_loss(cfg["train"])
+        stopper = EarlyStopper(patience=patience, min_delta=min_delta, mode="max")
 
+        best_ev, best_state = -1.0, None
         for epoch in range(1, max_epochs + 1):
-            tr_loss = train_one_epoch(model, dl_tr, opt, pos_weight, device)
+            tr_loss = train_one_epoch(model, dl_tr, opt, loss_fn, device, hazard_lambda)
             ev = evaluate(model, dl_ev, device)
             if ev["f1"] > best_ev:
                 best_ev = ev["f1"]
-                # Save DP-safe state
                 state = model.state_dict()
                 best_state = {k: v.cpu() for k, v in state.items()}
-            print(f"Epoch {epoch}/{max_epochs} | train_loss={tr_loss:.4f} | eval_f1={ev['f1']:.3f}")
+
+            print(f"Epoch {epoch}/{max_epochs} | train_loss={tr_loss:.4f} | "
+                  f"eval_f1={ev['f1']:.3f} | acc={ev['acc']:.3f} | prec={ev['precision']:.3f} | rec={ev['recall']:.3f}")
+
+            if stopper.step(ev["f1"]):
+                print(f"[EarlyStop] patience reached at epoch {epoch}")
+                break
 
         # Restore best for test (handle DP prefixes)
         if best_state is not None:
@@ -340,10 +547,10 @@ def loso_eval(cfg, out_dir, subjects_limit=None):
         writer.writerows(rows)
 
     summary = {
-        "avg_acc": np.mean([float(r["acc"]) for r in rows]),
-        "avg_f1": np.mean([float(r["f1"]) for r in rows]),
-        "avg_precision": np.mean([float(r["precision"]) for r in rows]),
-        "avg_recall": np.mean([float(r["recall"]) for r in rows]),
+        "avg_acc": float(np.mean([float(r["acc"]) for r in rows])) if rows else 0.0,
+        "avg_f1": float(np.mean([float(r["f1"]) for r in rows])) if rows else 0.0,
+        "avg_precision": float(np.mean([float(r["precision"]) for r in rows])) if rows else 0.0,
+        "avg_recall": float(np.mean([float(r["recall"]) for r in rows])) if rows else 0.0,
         "n_folds": len(rows)
     }
     with open(os.path.join(out_dir, "results_summary.json"), "w") as jf:
