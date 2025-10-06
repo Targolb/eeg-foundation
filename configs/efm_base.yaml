@@ -1,0 +1,39 @@
+# configs/efm_base.yaml
+
+seed: 42
+
+# where your LOSO loader pulls from
+data:
+  root: /data/processed
+  datasets:
+    - chbmit
+  subjects: [ chb01, chb02, chb03, chb04, chb05 ]   # or your full list
+
+# top-level in_ch (so the old code works)
+in_ch: 19
+
+model:
+  dim: 256
+  raw_depth: 4
+  spec_depth: 4
+  heads: 4
+  drop: 0.1
+  patch_len: 64
+  n_fft: 256
+  hop: 128
+  spec_ch: 4
+  patch2d: [ 8, 8 ]
+  proj_dim: 128
+  cls_hidden: 256
+  use_hazard: false
+  hz_bins: 12
+
+train:
+  batch_size: 16
+  lr: 3.0e-4
+  weight_decay: 0.05
+  epochs: 5
+  pos_weight: 3.0
+
+io:
+  workers: 8
