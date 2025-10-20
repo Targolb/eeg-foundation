@@ -1,0 +1,61 @@
+exp_name: efm_ssl_base
+seed: 42
+datasets:
+  roots:
+    - /scratch0/Targol/processed/chbmit
+    - /scratch0/Targol/processed/tusz
+    - /scratch0/Targol/processed/tuh
+  sample_rate: 256
+  window_len_s: 30
+  drop_artifacts: true
+model:
+  raw_encoder: efm_raw_tiny      # your 1D branch
+  spec_encoder: efm_spec_maxvit  # your 2D branch
+  fusion: cross_attn_gated
+ssl_heads:
+  mem:
+    mask_ratio_min: 0.30
+    mask_ratio_max: 0.60
+    time_span: [64, 256]
+    channel_drop_p: 0.10
+    ema_momentum: 0.996
+    loss_w: 1.0
+  contrastive:
+    proj_dim: 256
+    temperature: 0.07
+    queue_size: 65536
+    ema_momentum: 0.996
+    loss_w: 1.0
+  jigsaw:
+    segments: 4
+    loss_w: 0.5
+  grl:
+    datasets: ["chbmit","tusz","tuh"]
+    lambda_ramp_pct: 0.3
+    loss_w: 0.2
+  subject_proto:
+    dim: 512
+    momentum: 0.9
+    loss_w: 0.5
+train:
+  optimizer: adamw
+  base_lr: 3.0e-4
+  weight_decay: 0.05
+  warmup_steps: 2000
+  total_steps: 200000
+  grad_clip: 1.0
+  global_batch_target: 1024
+  amp: true
+log:
+  interval_steps: 100
+  eval_linear_probe_every: 5000
+  knn_eval_k: 200
+save:
+  ckpt_every: 10000
+  out_dir: runs/ssl/efm_ssl_base
+adapters:
+  enable_lora: true
+  target_modules: ["attn.q_proj","attn.v_proj"]
+  r: 8
+  alpha: 16
+  per_dataset: true
