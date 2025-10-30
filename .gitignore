@@ -183,3 +183,4 @@ temp/
 **/__temp__/
 **/.ipynb_checkpoints/
 figures/
+eeg_npz_sample/

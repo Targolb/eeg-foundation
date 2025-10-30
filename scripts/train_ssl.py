@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Clean Step 4: Self-Supervised Pretraining (SSL)
-- Objectives: MEM proxy, multi-view contrastive (raw<->spec), jigsaw, GRL, subject-prototype alignment.
-- Upgrades:
-    (1) Adaptive weighting: --adaptive-weights {none,uncertainty,cosine}
-    (2) Cross-subject contrast: --loss-w-subj 0.5 (SupCon over same-subject samples in batch)
-    (3) Seizure-aware scaling (auto; uses minutes_to_seizure / phase if present in .npz)
-    (4) Hardened saves, NaN guards, device-safe EMA.
-- Hyphenated CLI flags (e.g., --data-roots, --batch-size).
+Step 4 — Self-Supervised Pretraining (SSL) for EFM
+--------------------------------------------------
+Objectives combined:
+  • MEM proxy (latent regression)
+  • Multi-view contrastive (raw <-> spectro)
+  • Temporal order / jigsaw
+  • Dataset invariance via GRL
+  • Subject-prototype alignment
+  • (Optional) subject-level SupCon
 
-Swap Dummy* encoders with your real EFM encoders when ready.
+Upgrades:
+  (1) Adaptive weights: --adaptive-weights {none,uncertainty,cosine}
+  (2) Cross-subject contrast: --loss-w-subj (SupCon over same-subject samples)
+  (3) Seizure-aware scaling (minutes_to_seizure/phase if present in .npz)
+  (4) Hardened saves, NaN guards, device-safe EMA
+  (5) Auto-import real encoders from efm/models/models_transformer.py (fallback to dummy)
+
+CLI: hyphenated flags, e.g. --data-roots, --batch-size
 """
+
 import os, math, time, json, random, argparse, pathlib
 from dataclasses import dataclass
 from typing import List, Dict, Optional
@@ -27,9 +37,10 @@ except Exception:
     yaml = None
 
 
-# --------------------------
+# ======================================================
 # Utils
-# --------------------------
+# ======================================================
+
 def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
@@ -75,7 +86,7 @@ class EMA:
                 self.shadow[n] = p.data.clone().detach().to(p.device)
             if self.shadow[n].device != p.device:
                 self.shadow[n] = self.shadow[n].to(p.device)
-            self.shadow[n].mul_((self.m)).add_(p.data, alpha=1.0 - self.m)
+            self.shadow[n].mul_(self.m).add_(p.data, alpha=1.0 - self.m)
 
 
 class GradReverse(torch.autograd.Function):
@@ -93,13 +104,19 @@ def grad_reverse(x, lambd: float):
     return GradReverse.apply(x, lambd)
 
 
-# --------------------------
+# ======================================================
 # Dataset
-# --------------------------
+# ======================================================
+
 class EEGNPZDataset(Dataset):
-    def __init__(self, roots: List[str], drop_artifacts: bool = False, sample_rate: int = 256,
-                 subjects_per_dataset: Optional[int] = None,
-                 subjects_allowlist: Optional[Dict[str, List[str]]] = None):
+    def __init__(
+            self,
+            roots: List[str],
+            drop_artifacts: bool = False,
+            sample_rate: int = 256,
+            subjects_per_dataset: Optional[int] = None,
+            subjects_allowlist: Optional[Dict[str, List[str]]] = None
+    ):
         self.files = []
         tmp_files = []
         for root in roots:
@@ -137,7 +154,7 @@ class EEGNPZDataset(Dataset):
         d = np.load(path, allow_pickle=True)
         x = d['x'].astype(np.float32)  # (C, T)
         mask_missing = d['mask_missing'].astype(np.float32)  # (C,) or (C,1)
-        # seizure-aware meta if available (optional)
+        # Optional seizure-aware meta
         tts = float(d.get('minutes_to_seizure', np.nan)) if 'minutes_to_seizure' in d else np.nan
         phase = str(d.get('phase', 'unknown')) if 'phase' in d else 'unknown'
         return {
@@ -150,9 +167,27 @@ class EEGNPZDataset(Dataset):
         }
 
 
-# --------------------------
-# Model components (dummy encoders — replace later)
-# --------------------------
+# ======================================================
+# Encoders (auto-import real ones or fallback to dummy)
+# ======================================================
+
+USE_REAL = False
+TemporalTransformerEncoder = None
+MaxViTSpectrogramEncoder = None
+FusionHead = None
+
+try:
+    from efm.models.models_transformer import (
+        TemporalTransformerEncoder,  # expects forward(x: (B,C,T)) -> (B,D)
+        MaxViTSpectrogramEncoder,  # expects forward(spec: (B,C,F,T)) -> (B,D)
+        FusionHead  # expects forward(r: (B,D), s: (B,D)) -> (B,D)
+    )
+
+    USE_REAL = True
+except Exception:
+    USE_REAL = False
+
+
 class DummyEFMRawEncoder(nn.Module):
     def __init__(self, out_dim=512):
         super().__init__()
@@ -188,9 +223,10 @@ class DummyFusion(nn.Module):
         return self.fc(torch.cat([r, s], dim=-1))
 
 
-# --------------------------
+# ======================================================
 # STFT + Augmentations
-# --------------------------
+# ======================================================
+
 class SimpleLogSTFT(nn.Module):
     def __init__(self, n_fft: int = 256, hop: int = 128, eps: float = 1e-6):
         super().__init__()
@@ -203,7 +239,7 @@ class SimpleLogSTFT(nn.Module):
         for c in range(C):
             S = torch.stft(x[:, c, :], n_fft=self.n_fft, hop_length=self.hop, return_complex=True)
             P = (S.real ** 2 + S.imag ** 2).clamp_min(self.eps)
-            specs.append(torch.log(P + self.eps))  # belt & suspenders
+            specs.append(torch.log(P + self.eps))
         spec = torch.stack(specs, dim=1)  # (B,C,F,TT)
         return spec
 
@@ -229,16 +265,10 @@ class RawAug(nn.Module):
                 x2[b, :, s:] = x[b, :, :T - s]
             else:
                 x2[b, :, :T + s] = x[b, :, -s:]
-
-        # gaussian noise
-        x2 = x2 + self.noise_sigma * torch.randn_like(x2)
-
-        # channel dropout (respect missing)
+        x2 = x2 + self.noise_sigma * torch.randn_like(x2)  # noise
         drop = (torch.rand(B, C, 1, device=x.device) < self.channel_drop_p).float()
         mm = mask_missing.unsqueeze(-1) if mask_missing.ndim == 2 else mask_missing
         x2 = x2 * (1.0 - drop) * (1.0 - mm) + x2 * (1.0 - mm)
-
-        # simple time-warp by resampling (nearest)
         warp = 1.0 + (2 * torch.rand(B, device=x.device) - 1.0) * self.time_warp_pct
         out = torch.zeros_like(x2)
         grid = torch.linspace(0, 1, T, device=x.device)
@@ -272,9 +302,10 @@ class SpecAug(nn.Module):
         return out
 
 
-# --------------------------
+# ======================================================
 # Heads & Queues
-# --------------------------
+# ======================================================
+
 class ProjHead(nn.Module):
     def __init__(self, in_dim: int, proj_dim: int = 256):
         super().__init__()
@@ -370,9 +401,10 @@ class SubjectProtoBank(nn.Module):
         return F.cross_entropy(logits, idxs)
 
 
-# --------------------------
+# ======================================================
 # Extra losses / helpers
-# --------------------------
+# ======================================================
+
 def subject_supcon(z: torch.Tensor, subjects: List[str], temperature: float = 0.07):
     """
     Multi-positive (same-subject) contrastive loss on embeddings z.
@@ -384,18 +416,13 @@ def subject_supcon(z: torch.Tensor, subjects: List[str], temperature: float = 0.
     subj_arr = np.array(subjects)
     pos = torch.tensor(subj_arr[:, None] == subj_arr[None, :], device=z.device, dtype=torch.bool)
     pos = pos & (~eye)
-
     denom_mask = ~eye
-    # For numerical stability, compute log-softmax row-wise with mask
     log_denom = torch.logsumexp(sim.masked_fill(~denom_mask, float('-inf')), dim=1, keepdim=True)
-
-    # numerator: sum over positives; handle rows with no positives
     pos_logsum = torch.where(
         pos.any(dim=1, keepdim=True),
         torch.logsumexp(sim.masked_fill(~pos, float('-inf')), dim=1, keepdim=True),
         torch.full((B, 1), 0.0, device=z.device)
     )
-
     valid = pos.any(dim=1)
     if valid.any():
         loss = -(pos_logsum[valid] - log_denom[valid]).mean()
@@ -414,7 +441,6 @@ def seizure_weight(batch, tau_min=10.0, tau_max=60.0):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     w = None
     if tts is not None:
-        # batch may give tts as list[float]
         tts_arr = np.array(tts, dtype=np.float32) if isinstance(tts, (list, tuple, np.ndarray)) else np.array([tts],
                                                                                                               dtype=np.float32)
         tts_t = torch.tensor(tts_arr, device=device)
@@ -443,27 +469,37 @@ def cosine_weight(step, total, base):
     return base * (0.3 + 0.7 * 0.5 * (1 + math.cos(math.pi * s)))
 
 
-# --------------------------
+# ======================================================
 # EFM SSL wrapper
-# --------------------------
+# ======================================================
+
 class EFM_SSL(nn.Module):
-    def __init__(self, proj_dim=256, num_domains=3, jigsaw_perms=24, ema_m=0.996, queue_size=65536, proto_m=0.9):
+    def __init__(self, proj_dim=256, num_domains=3, jigsaw_perms=24, ema_m=0.996, queue_size=65536, proto_m=0.9,
+                 real_in_ch: int = 19, real_hidden_dim: int = 512):
         super().__init__()
-        self.raw_enc = DummyEFMRawEncoder(512)
-        self.spec_enc = DummyEFMSpecEncoder(19, 512)
-        self.fusion = DummyFusion(512)
 
-        self.raw_proj = ProjHead(512, proj_dim)
-        self.spec_proj = ProjHead(512, proj_dim)
+        if USE_REAL and (TemporalTransformerEncoder is not None) and (MaxViTSpectrogramEncoder is not None):
+            self.raw_enc = TemporalTransformerEncoder(embed_dim=real_hidden_dim)
+            self.spec_enc = MaxViTSpectrogramEncoder(in_channels=real_in_ch, embed_dim=real_hidden_dim)
+            self.fusion = FusionHead(in_dim=real_hidden_dim) if (FusionHead is not None) else DummyFusion(
+                real_hidden_dim)
+        else:
+            self.raw_enc = DummyEFMRawEncoder(real_hidden_dim)
+            self.spec_enc = DummyEFMSpecEncoder(real_in_ch, real_hidden_dim)
+            self.fusion = DummyFusion(real_hidden_dim)
 
-        self.jigsaw_head = JigsawHead(512, jigsaw_perms)
-        self.domain_head = DomainHead(512, num_domains)
+        self.raw_proj = ProjHead(real_hidden_dim, proj_dim)
+        self.spec_proj = ProjHead(real_hidden_dim, proj_dim)
+
+        self.jigsaw_head = JigsawHead(real_hidden_dim, jigsaw_perms)
+        self.domain_head = DomainHead(real_hidden_dim, num_domains)
 
         self.raw_ema = EMA(self.raw_enc, ema_m)
         self.spec_ema = EMA(self.spec_enc, ema_m)
 
-        self.queue = MemoryQueue(proj_dim, size=queue_size, device='cuda' if torch.cuda.is_available() else 'cpu')
-        self.proto = SubjectProtoBank(dim=512, momentum=proto_m)
+        dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.queue = MemoryQueue(proj_dim, size=queue_size, device=dev)
+        self.proto = SubjectProtoBank(dim=real_hidden_dim, momentum=proto_m)
 
     def forward_raw_latent(self, x):
         return self.raw_enc(x)
@@ -472,9 +508,10 @@ class EFM_SSL(nn.Module):
         return self.spec_enc(spec)
 
 
-# --------------------------
+# ======================================================
 # Config
-# --------------------------
+# ======================================================
+
 @dataclass
 class SSLConfig:
     data_roots: List[str] = None
@@ -498,9 +535,10 @@ class SSLConfig:
     adaptive_weights: str = 'none'  # none|uncertainty|cosine
 
 
-# --------------------------
+# ======================================================
 # MEM mask helper
-# --------------------------
+# ======================================================
+
 def masked_eeg_targets(x: torch.Tensor,
                        mask_ratio_min: float,
                        mask_ratio_max: float,
@@ -526,9 +564,10 @@ def masked_eeg_targets(x: torch.Tensor,
     return mask
 
 
-# --------------------------
+# ======================================================
 # Train
-# --------------------------
+# ======================================================
+
 def make_domain_index(names: List[str]) -> Dict[str, int]:
     uniq = sorted(set(names))
     return {n: i for i, n in enumerate(uniq)}
@@ -541,12 +580,18 @@ def train(cfg: SSLConfig):
     # Data
     allow = None
     if cfg.subjects_allowlist_path and os.path.exists(cfg.subjects_allowlist_path):
-        with open(cfg.subjects_allowlist_path) as f:
-            allow = json.load(f)
+        try:
+            with open(cfg.subjects_allowlist_path) as f:
+                allow = json.load(f)
+        except Exception:
+            allow = None
+
     ds = EEGNPZDataset(cfg.data_roots, subjects_per_dataset=cfg.subjects_per_dataset, subjects_allowlist=allow)
     domain_map = make_domain_index([dsname for (_, dsname, _) in ds.files])
-    loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers,
-                        pin_memory=True, drop_last=True)
+    loader = DataLoader(
+        ds, batch_size=cfg.batch_size, shuffle=True,
+        num_workers=cfg.num_workers, pin_memory=True, drop_last=True
+    )
     print(f"Dataset loaded with {len(ds)} samples.")
 
     # Model & optim
@@ -565,7 +610,6 @@ def train(cfg: SSLConfig):
             'jig': nn.Parameter(torch.zeros(1, device=device)),
             'grl': nn.Parameter(torch.zeros(1, device=device)),
             'proto': nn.Parameter(torch.zeros(1, device=device)),
-            # 'subj': nn.Parameter(torch.zeros(1, device=device)),  # enable if you want uncertainty on L_subj too
         }
         for v in log_sig.values():
             v.requires_grad_(True)
@@ -577,6 +621,9 @@ def train(cfg: SSLConfig):
         return (L / (2.0 * s2)).sum() + log_sig[name].sum()
 
     os.makedirs(cfg.out_dir, exist_ok=True)
+    with open(os.path.join(cfg.out_dir, 'ssl_config.json'), 'w') as f:
+        json.dump(cfg.__dict__, f, indent=2)
+
     step, t0 = 0, time.time()
     total_steps = cfg.total_steps
     warmup_steps = max(1, int(0.01 * total_steps))
@@ -585,6 +632,7 @@ def train(cfg: SSLConfig):
         for batch in loader:
             if step >= total_steps:
                 break
+
             x = torch.as_tensor(batch['x_raw']).to(device)  # (B,C,T)
             mm = torch.as_tensor(batch['mask_missing']).to(device)  # (B,C) or (B,C,1)
             subjects = batch['subject']
@@ -600,18 +648,18 @@ def train(cfg: SSLConfig):
             spec = spec_aug(stft(x))
             spec = torch.nan_to_num(spec, nan=0.0, posinf=0.0, neginf=0.0)
 
-            # MEM mask (placeholder; not used directly with dummy latent MSE)
+            # MEM mask (placeholder; used with latent proxy)
             _ = masked_eeg_targets(x_v1, 0.30, 0.60, 64, 256)
 
             opt.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                 # Student latents
-                r_lat_v1 = model.forward_raw_latent(x_v1)
-                r_lat_v2 = model.forward_raw_latent(x_v2)
-                s_lat = model.forward_spec_latent(spec)
+                r_lat_v1 = model.forward_raw_latent(x_v1)  # (B,D)
+                r_lat_v2 = model.forward_raw_latent(x_v2)  # (B,D)
+                s_lat = model.forward_spec_latent(spec)  # (B,D)
 
-                q_raw = model.raw_proj(r_lat_v1)
-                q_spec = model.spec_proj(s_lat)
+                q_raw = model.raw_proj(r_lat_v1)  # (B,P)
+                q_spec = model.spec_proj(s_lat)  # (B,P)
 
                 # EMA teachers
                 model.raw_ema.update(model.raw_enc)
@@ -655,13 +703,12 @@ def train(cfg: SSLConfig):
                     w_grl = cosine_weight(step, total_steps, cfg.loss_w_grl)
                     w_pro = cosine_weight(step, total_steps, cfg.loss_w_proto)
                     w_sub = cosine_weight(step, total_steps, cfg.loss_w_subj)
-                    loss = (
-                            w_mem * L_mem + w_con * L_contrast + w_jig * L_jig + w_grl * L_grl + w_pro * L_proto + w_sub * L_subj)
+                    loss = w_mem * L_mem + w_con * L_contrast + w_jig * L_jig + w_grl * L_grl + w_pro * L_proto + w_sub * L_subj
                 elif adaptive == 'uncertainty':
-                    loss = UW('mem', L_mem) + UW('contrast', L_contrast) + UW('jig', L_jig) + UW('grl', L_grl) + UW(
-                        'proto', L_proto)
-                    # If you enabled uncertainty for 'subj', add UW('subj', L_subj); else weight it normally:
-                    loss = loss + cfg.loss_w_subj * L_subj
+                    # Kendall & Gal uncertainty weighting
+                    loss = (UW('mem', L_mem) + UW('contrast', L_contrast) +
+                            UW('jig', L_jig) + UW('grl', L_grl) + UW('proto', L_proto)) \
+                           + cfg.loss_w_subj * L_subj
                 else:
                     loss = (cfg.loss_w_mem * L_mem +
                             cfg.loss_w_contrast * L_contrast +
@@ -683,7 +730,9 @@ def train(cfg: SSLConfig):
                 }))
                 with torch.no_grad():
                     reinit_count = min(1024, model.queue.size)
-                    reinit = safe_normalize(torch.randn(reinit_count, model.queue.queue.size(1), device=device), dim=-1)
+                    reinit = safe_normalize(
+                        torch.randn(reinit_count, model.queue.queue.size(1), device=device), dim=-1
+                    )
                     model.queue.queue[:reinit_count] = reinit
                 step += 1
                 continue
@@ -713,9 +762,10 @@ def train(cfg: SSLConfig):
     safe_save({'model': model.state_dict()}, os.path.join(cfg.out_dir, 'efm_base.ckpt'))
 
 
-# --------------------------
+# ======================================================
 # Argparse
-# --------------------------
+# ======================================================
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--config', type=str, default=None)
@@ -764,6 +814,10 @@ def parse_args():
     cfg.out_dir = args.out
     return cfg
 
+
+# ======================================================
+# Main
+# ======================================================
 
 if __name__ == '__main__':
     cfg = parse_args()
